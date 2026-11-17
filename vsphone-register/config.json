@@ -1,0 +1,36 @@
+{
+  "loginUrl": "https://cloud.vsphone.com/login",
+  "count": 5,
+  "parallel": 1,
+  "delayMs": 25000,
+  "delayJitterMs": 10000,
+  "headless": false,
+  "slowMo": 0,
+  "captchaTimeoutMs": 300000,
+  "mailTimeoutMs": 180000,
+  "autoCaptcha": true,
+  "powDelay": 6000,
+  "saveDebug": false,
+  "debug": false,
+  "passwordLength": 12,
+  "mailbox": {
+    "provider": "inboxkitten",
+    "providers": ["inboxkitten", "mailtm", "guerrillamail"],
+    "domain": "",
+    "apiBase": "https://api.mail.tm",
+    "guerrillaApiBase": "https://api.guerrillamail.com/ajax.php",
+    "inboxkittenApiBase": "https://inboxkitten.com/api/v1/mail",
+    "inboxkittenDomain": "inboxkitten.com"
+  },
+  "database": {
+    "enabled": false,
+    "connectionString": "",
+    "table": "vsphone_accounts"
+  },
+  "output": {
+    "dir": "output",
+    "json": "accounts.json",
+    "csv": "accounts.csv",
+    "txt": "accounts.txt"
+  }
+}

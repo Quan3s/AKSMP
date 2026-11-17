@@ -1,0 +1,19 @@
+{
+  "name": "vsphone-register",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Tool dang ky tu dong cho cloud.vsphone.com (email + Aliyun slider captcha solver)",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:1": "node src/index.js --count 1",
+    "probe": "node src/index.js --count 1 --dry-run",
+    "test": "node test/pickcode.test.js && node test/solver.test.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "playwright": "^1.56.0",
+    "sharp": "^0.33.5"
+  }
+}
