@@ -1,29 +1,44 @@
 'use strict';
 
 /**
- * vsphone-register — API Server (multi-worker pool)
+ * vsphone-register — server.js
  *
- * POST/GET /register
- *   Header: x-api-key: <key>  hoac  ?apikey=<key>
+ * Background loop: tao tk lien tuc (1 tk -> sleep 25s -> tiep).
+ *   - thanh cong: luu postgres + tao github gist -> luu api_token
+ *   - that bai: KHONG luu db, kill playwright, spawn lai sau sleep
  *
- * POST/GET /register?max=3   <- override so worker cho session nay
+ * API:
+ *   GET/POST /register?apikey=<key>
+ *     -> { ok, account: "email|password", token: "<api_token>" }
+ *     (account bi xoa khoi db ngay sau khi tra ve)
  *
- * GET /health  -> { ok, workers: [{id, busy}], queued }
+ *   GET /token/<api_token>
+ *     -> { ok, gist_url: "https://gist.githubusercontent.com/..." }
+ *     (bang vsphone_tokens khong bi xoa, truy cap bat cu luc nao)
  *
- * Config:
- *   server.maxParallel  trong config.json  (default 1)
- *   env MAX_PARALLEL    ghi de config
+ *   GET /health
+ *     -> { ok, queued, loop }
+ *
+ * Env:
+ *   DATABASE_URL   postgres connection string (Railway tu inject)
+ *   GITHUB_TOKEN   PAT scope: gist
+ *   API_KEYS       comma-separated
+ *   PORT           default 3000
  */
 
-const http    = require('http');
-const fs      = require('fs');
-const path    = require('path');
+const http   = require('http');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
+
 const { VSPhoneRegistrar, sleep } = require('./registrar');
 const { createMailbox }           = require('./mailbox');
+const { AccountDB }               = require('./db');
+const { createGist }              = require('./gist');
 
 const ROOT = path.resolve(__dirname, '..');
 
-// ─────────────────────────────────────────────── helpers ────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 function loadConfig() {
   const file = path.join(ROOT, 'config.json');
@@ -48,204 +63,160 @@ function genPassword(len = 12) {
 
 function parseQuery(url) {
   const idx = url.indexOf('?');
-  if (idx === -1) return {};
-  return Object.fromEntries(new URLSearchParams(url.slice(idx + 1)));
+  return idx === -1 ? {} : Object.fromEntries(new URLSearchParams(url.slice(idx + 1)));
 }
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(json),
-  });
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(json) });
   res.end(json);
 }
 
-// ─────────────────────────────────────────────── worker pool ────────────────
+// ── background loop ───────────────────────────────────────────────────────────
 
-class WorkerPool {
-  /**
-   * @param {object}   baseCfg    - config goc tu config.json
-   * @param {number}   maxWorkers - so session browser toi da
-   * @param {string[]} providers  - mailbox providers
-   * @param {Function} log
-   */
-  constructor(baseCfg, maxWorkers, providers, log) {
-    this.baseCfg    = baseCfg;
-    this.maxWorkers = maxWorkers;
-    this.providers  = providers;
-    this.log        = log;
-
-    // mang cac worker: { id, session: VSPhoneRegistrar|null, busy: bool }
-    this.workers = Array.from({ length: maxWorkers }, (_, i) => ({
-      id:      i + 1,
-      session: null,
-      busy:    false,
-    }));
-
-    // hang doi khi tat ca worker deu ban
-    this.queue = [];
+class RegistrarLoop {
+  constructor(cfg, db, providers, log) {
+    this.cfg       = cfg;
+    this.db        = db;
+    this.providers = providers;
+    this.log       = log;
+    this.state     = 'stopped';
+    this._reg      = null;
   }
 
-  /** Khoi dong browser cho worker neu chua co. */
-  async _ensureSession(worker) {
-    if (worker.session) return;
-    this.log(`[pool] worker #${worker.id} — khoi dong browser...`);
-    const cfg = { ...this.baseCfg, headless: true, autoCaptcha: this.baseCfg.autoCaptcha ?? true };
-
-    if (worker.id === 1) {
-      // worker dau tien: browser rieng
-      const registrar = new VSPhoneRegistrar(cfg, this.log);
-      await registrar.launch();
-      worker.session = registrar;
-    } else {
-      // cac worker sau: dung newSession() de share browser process
-      // nhung moi worker co context + page rieng
-      const first = this.workers[0].session;
-      if (!first) throw new Error('worker #1 chua khoi dong');
-      worker.session = await first.newSession();
+  async _kill() {
+    if (this._reg) {
+      try { await this._reg.close(); } catch (_) {}
+      this._reg = null;
     }
-    this.log(`[pool] worker #${worker.id} san sang`);
   }
 
-  /** Tim worker ranh, neu het thi tra null. */
-  _freeWorker() {
-    return this.workers.find((w) => !w.busy) || null;
-  }
-
-  /** Chay 1 task tao tai khoan tren worker cu the. */
-  async _run(worker) {
-    await this._ensureSession(worker);
-
-    const cfg       = this.baseCfg;
-    const provider  = this.providers[0];
-    const mailbox   = createMailbox(
-      { ...(cfg.mailbox || {}), provider },
+  async _spawn() {
+    await this._kill();
+    const r = new VSPhoneRegistrar(
+      { ...this.cfg, headless: true, autoCaptcha: this.cfg.autoCaptcha ?? true },
       this.log,
     );
-    const created  = await mailbox.create();
-    const email    = created.address;
-    const password = genPassword(cfg.passwordLength || 12);
-
-    const account = await worker.session.registerOne({ email, password, mailbox });
-    return {
-      ok:           true,
-      account:      `${account.email}|${account.password}`,
-      localStorage: account.localStorage || {},
-      worker:       worker.id,
-    };
+    await r.launch();
+    this._reg = r;
+    return r;
   }
 
-  /**
-   * Nhan 1 request:
-   *  - neu co worker ranh -> chay ngay
-   *  - neu het -> day vao queue, cho worker ranh
-   */
-  enqueue() {
-    return new Promise((resolve, reject) => {
-      const task = { resolve, reject };
-      const worker = this._freeWorker();
-      if (worker) {
-        this._dispatch(worker, task);
-      } else {
-        this.log(`[pool] tat ca ${this.maxWorkers} worker deu ban — them vao hang doi (${this.queue.length + 1})`);
-        this.queue.push(task);
+  async run() {
+    this.state = 'running';
+    while (this.state !== 'stopped') {
+      try {
+        this.state = 'running';
+        const reg = await this._spawn();
+
+        // chon mailbox provider theo failover
+        let mailbox = null;
+        let usedProvider = null;
+        for (const p of this.providers) {
+          try {
+            const mb = createMailbox({ ...(this.cfg.mailbox || {}), provider: p }, this.log);
+            await mb.create();
+            mailbox      = mb;
+            usedProvider = p;
+            break;
+          } catch (e) {
+            this.log(`[loop] mailbox ${p} loi: ${e.message}`);
+          }
+        }
+        if (!mailbox) throw new Error('Tat ca mailbox provider deu loi');
+
+        const email    = mailbox.address;
+        const password = genPassword(this.cfg.passwordLength || 12);
+        this.log(`[loop] tao tk: ${email} (${usedProvider})`);
+
+        // dang ky (neu loi se throw -> xuong catch -> kill + restart)
+        const account = await reg.registerOne({ email, password, mailbox });
+
+        // tao gist chua localStorage
+        const apiToken = crypto.randomBytes(24).toString('hex');
+        const gistUrl  = await createGist({
+          email:        account.email,
+          localStorage: account.localStorage,
+        });
+
+        // luu vao db (ca account lan token -> gist)
+        await this.db.save(account, apiToken, gistUrl);
+        this.log(`[loop] OK: ${account.email} token=${apiToken}`);
+
+      } catch (err) {
+        // FAIL -> kill playwright, KHONG luu db
+        this.log(`[loop] FAIL (${err.message}) — kill playwright, restart sau sleep`);
+        this.state = 'restarting';
+        await this._kill();
       }
-    });
-  }
 
-  /** Gan task cho worker va chay. */
-  _dispatch(worker, task) {
-    worker.busy = true;
-    this.log(`[pool] worker #${worker.id} bat dau task (queue con lai: ${this.queue.length})`);
-
-    this._run(worker)
-      .then((result) => task.resolve(result))
-      .catch((err)   => task.reject(err))
-      .finally(() => {
-        worker.busy = false;
-        this.log(`[pool] worker #${worker.id} xong`);
-        this._drain();
-      });
-  }
-
-  /** Lay task tiep theo tu queue neu co worker ranh. */
-  _drain() {
-    if (this.queue.length === 0) return;
-    const worker = this._freeWorker();
-    if (!worker) return;
-    const task = this.queue.shift();
-    this._dispatch(worker, task);
-  }
-
-  status() {
-    return {
-      workers: this.workers.map((w) => ({ id: w.id, busy: w.busy, ready: !!w.session })),
-      queued:  this.queue.length,
-    };
-  }
-
-  async shutdown() {
-    for (const w of this.workers) {
-      if (w.session) {
-        try { await w.session.close(); } catch (_) { /* ignore */ }
+      // nghi 25s du thanh cong hay that bai
+      if (this.state !== 'stopped') {
+        this.log('[loop] sleep 25s...');
+        await sleep(25000);
       }
     }
+  }
+
+  async stop() {
+    this.state = 'stopped';
+    await this._kill();
   }
 }
 
-// ─────────────────────────────────────────────── main ───────────────────────
+// ── main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   const cfg = loadConfig();
+  const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-  const port       = Number(process.env.PORT)         || cfg.server?.port        || 3000;
-  const maxWorkers = Number(process.env.MAX_PARALLEL) || cfg.server?.maxParallel || 1;
+  const port = Number(process.env.PORT) || cfg.server?.port || 3000;
 
-  const apiKeys = new Set(
-    (cfg.server?.apiKeys || [])
-      .concat(process.env.API_KEYS ? process.env.API_KEYS.split(',').map((k) => k.trim()) : [])
-      .filter(Boolean),
-  );
+  const apiKeys = new Set([
+    ...(cfg.server?.apiKeys || []),
+    ...(process.env.API_KEYS ? process.env.API_KEYS.split(',').map((k) => k.trim()) : []),
+  ].filter(Boolean));
 
-  if (apiKeys.size === 0) {
-    console.error('[server] CANH BAO: chua co apiKey — moi request deu bi tu choi');
-  }
+  if (apiKeys.size === 0) log('[server] CANH BAO: chua co API_KEYS');
 
-  const regCfg = {
-    ...cfg,
-    headless:    true,
-    autoCaptcha: cfg.autoCaptcha ?? true,
-    mailbox: {
-      ...(cfg.mailbox || {}),
-      provider: cfg.mailbox?.provider || 'mailtm',
-    },
-  };
+  // db
+  const db = new AccountDB({
+    connectionString: process.env.DATABASE_URL || cfg.database?.connectionString || '',
+    table: cfg.database?.table || 'vsphone_accounts',
+    log,
+  });
+  await db.connect();
 
+  // providers
   const providers = cfg.mailbox?.providers?.length
     ? cfg.mailbox.providers
-    : [regCfg.mailbox.provider, 'guerrillamail'].filter((v, i, a) => a.indexOf(v) === i);
+    : [cfg.mailbox?.provider || 'inboxkitten', 'mailtm', 'guerrillamail'];
 
-  console.log(`[server] khoi dong pool ${maxWorkers} worker...`);
-  const pool = new WorkerPool(regCfg, maxWorkers, providers, console.log);
+  // start loop (non-blocking)
+  const loop = new RegistrarLoop(cfg, db, providers, log);
+  loop.run().catch((err) => log('[loop] FATAL:', err.message));
 
-  // khoi dong worker #1 ngay (cac worker khac lazy-init khi can)
-  await pool._ensureSession(pool.workers[0]);
-
-  // ── http server ──────────────────────────────────────────────────────────
+  // ── http server ───────────────────────────────────────────────────────────
   const server = http.createServer(async (req, res) => {
     const url      = req.url || '/';
     const query    = parseQuery(url);
     const pathname = url.split('?')[0];
 
-    // health
+    // /health
     if (pathname === '/health' || pathname === '/ping') {
-      return send(res, 200, { ok: true, ...pool.status() });
+      return send(res, 200, { ok: true, queued: await db.count(), loop: loop.state });
     }
 
-    if (pathname !== '/register') {
-      return send(res, 404, { ok: false, error: 'not found' });
+    // /token/<48-char hex>
+    const tokenMatch = pathname.match(/^\/token\/([a-f0-9]{48})$/);
+    if (tokenMatch) {
+      const gistUrl = await db.getGistUrl(tokenMatch[1]);
+      if (!gistUrl) return send(res, 404, { ok: false, error: 'token not found' });
+      return send(res, 200, { ok: true, gist_url: gistUrl });
     }
+
+    // /register
+    if (pathname !== '/register') return send(res, 404, { ok: false, error: 'not found' });
 
     // auth
     const key = req.headers['x-api-key'] || query.apikey || query.apiKey || '';
@@ -253,35 +224,36 @@ async function main() {
       return send(res, 401, { ok: false, error: 'invalid api key' });
     }
 
-    const st = pool.status();
-    console.log(`[server] /register — workers busy: ${st.workers.filter((w) => w.busy).length}/${maxWorkers}, queued: ${st.queued}`);
-
-    try {
-      const result = await pool.enqueue();
-      return send(res, 200, result);
-    } catch (err) {
-      console.error('[server] loi:', err.message);
-      return send(res, 500, { ok: false, error: err.message });
+    // pop account (lay ra + xoa db ngay)
+    const row = await db.popAccount();
+    if (!row) {
+      return send(res, 503, {
+        ok:    false,
+        error: 'no accounts available yet, loop is building',
+        loop:  loop.state,
+      });
     }
+
+    return send(res, 200, {
+      ok:      true,
+      account: `${row.email}|${row.password}`,
+      token:   row.api_token || null,
+    });
   });
 
   server.listen(port, () => {
-    console.log(`[server] lang nghe port ${port} | ${maxWorkers} worker | apiKeys: ${apiKeys.size}`);
-    console.log(`[server] POST/GET http://localhost:${port}/register`);
-    console.log(`[server] GET       http://localhost:${port}/health`);
+    log(`[server] port=${port} | loop=running | db=${db.enabled ? 'ON' : 'OFF'} | keys=${apiKeys.size}`);
   });
 
   const shutdown = async () => {
-    console.log('[server] dang tat...');
+    log('[server] shutdown...');
     server.close();
-    await pool.shutdown();
+    await loop.stop();
+    await db.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((err) => {
-  console.error('[FATAL]', err);
-  process.exit(1);
-});
+main().catch((err) => { console.error('[FATAL]', err); process.exit(1); });
