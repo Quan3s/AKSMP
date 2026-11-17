@@ -15,7 +15,11 @@
   "passwordLength": 12,
   "mailbox": {
     "provider": "inboxkitten",
-    "providers": ["inboxkitten", "mailtm", "guerrillamail"],
+    "providers": [
+      "inboxkitten",
+      "mailtm",
+      "guerrillamail"
+    ],
     "domain": "",
     "apiBase": "https://api.mail.tm",
     "guerrillaApiBase": "https://api.guerrillamail.com/ajax.php",
@@ -32,5 +36,11 @@
     "json": "accounts.json",
     "csv": "accounts.csv",
     "txt": "accounts.txt"
+  },
+  "server": {
+    "port": 3000,
+    "apiKeys": [
+      "changeme-key-1"
+    ]
   }
 }

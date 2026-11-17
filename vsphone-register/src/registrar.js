@@ -381,25 +381,35 @@ class VSPhoneRegistrar {
       );
     }
 
+    // dump TOAN BO localStorage de tra ve qua API (khong luu gi ca)
+    const localStorage_ = await page
+      .evaluate(() => {
+        const out = {};
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          const v = localStorage.getItem(k);
+          // thu parse JSON, neu loi thi giu nguyen string
+          try { out[k] = JSON.parse(v); } catch (_) { out[k] = v; }
+        }
+        return out;
+      })
+      .catch(() => ({}));
+
     if (!userId) {
-      userId = await page
-        .evaluate(() => {
-          try {
-            const users = JSON.parse(localStorage.getItem('users') || '[]');
-            return users[0] && users[0].userId ? String(users[0].userId) : null;
-          } catch (_) {
-            return null;
-          }
-        })
-        .catch(() => null);
+      // fallback: lay tu localStorage_ neu co
+      userId = localStorage_.userId
+        || (Array.isArray(localStorage_.users) && localStorage_.users[0]?.userId
+            ? String(localStorage_.users[0].userId) : null)
+        || null;
     }
 
-    log(`[+] Dang ky thanh cong: ${email}`);
+    log(`[+] Dang ky thanh cong: ${email} (localStorage keys: ${Object.keys(localStorage_).join(', ')})`);
     return {
       email,
       password,
       token: token || null,
-      userId: userId || null,
+      userId: userId ? String(userId) : null,
+      localStorage: localStorage_,
       createdAt: new Date().toISOString(),
     };
   }
