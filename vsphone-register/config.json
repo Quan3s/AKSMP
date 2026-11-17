@@ -4,14 +4,14 @@
   "parallel": 1,
   "delayMs": 25000,
   "delayJitterMs": 10000,
-  "headless": false,
+  "headless": true,
   "slowMo": 0,
   "captchaTimeoutMs": 300000,
   "mailTimeoutMs": 180000,
   "autoCaptcha": true,
   "powDelay": 6000,
   "saveDebug": false,
-  "debug": false,
+  "debug": true,
   "passwordLength": 12,
   "mailbox": {
     "provider": "inboxkitten",
@@ -27,9 +27,12 @@
     "inboxkittenDomain": "inboxkitten.com"
   },
   "database": {
-    "enabled": false,
-    "connectionString": "",
+    "enabled": true,
+    "connectionString": "postgresql://neondb_owner:npg_lLpZQ4uMK3tO@ep-empty-star-b3ajzgz0-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
     "table": "vsphone_accounts"
+  },
+  "github": {
+    "token": "GITHUB_TOKEN_HERE"
   },
   "output": {
     "dir": "output",
@@ -42,6 +45,6 @@
     "apiKeys": [
       "changeme-key-1"
     ],
-    "maxParallel": 3
+    "maxParallel": 20
   }
 }

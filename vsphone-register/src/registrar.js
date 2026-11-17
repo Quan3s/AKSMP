@@ -17,9 +17,9 @@ const SEL = {
 };
 
 const API = {
-  checkEmail: '/api/user/checkEmail',
-  smsSend: '/api/sms/smsSend',
-  login: '/api/user/login',
+  checkEmail: '/vsphone/api/user/checkEmail',
+  smsSend: '/vsphone/api/sms/smsSend',
+  login: '/vsphone/api/user/login',
 };
 
 function sleep(ms) {
@@ -69,10 +69,6 @@ class VSPhoneRegistrar {
     }
   }
 
-  /**
-   * Mo them 1 cua so browser (context rieng) de chay song song.
-   * Moi cua so co 1 popup captcha rieng -> nguoi dung xoay vong keo slider.
-   */
   async newSession() {
     if (!this.browser) await this.launch();
     const context = await this.browser.newContext({
@@ -95,43 +91,117 @@ class VSPhoneRegistrar {
     return session;
   }
 
-  /** Cho doi mot response API khop pattern (tra ve {code,msg,data}). */
+  /**
+   * Dang ky lang nghe response NGAY (non-async, tra ve Promise).
+   * Goi truoc khi trigger action de tranh race condition khi page navigate.
+   *
+   * Dung page.on('response') + doc body NGAY TRONG CALLBACK truoc khi page navigate.
+   * Khong dung waitForResponse().then(res => res.text()) vi body bi giai phong sau navigate.
+   */
   waitForApi(path, timeoutMs) {
+    const cfg = this.cfg;
+    const log = this.log;
+    const page = this.page;
+
     return new Promise((resolve, reject) => {
+      let done = false;
       const timer = setTimeout(() => {
-        cleanup();
+        if (done) return;
+        done = true;
+        page.off('response', handler);
         reject(new Error(`Timeout ${timeoutMs}ms cho ${path}`));
       }, timeoutMs);
-      const onResponse = async (res) => {
+
+      const handler = async (res) => {
+        if (done) return;
         if (!res.url().includes(path)) return;
+        if (res.request().method() === 'OPTIONS') return;
+
+        // Doc body NGAY trong callback — truoc khi bat ky navigation nao xay ra
+        let text;
         try {
-          // bo qua preflight CORS / request khong phai API that
-          const method = res.request().method();
-          if (method === 'OPTIONS') return;
-          const text = await res.text();
-          if (this.cfg && this.cfg.debug) {
-            this.log(`[api] ${method} ${res.status()} ${res.url()} :: ${text.slice(0, 300)}`);
-          }
+          const buf = await res.body(); text = buf.toString('utf8');
+        } catch (e) {
+          // body mat roi (trang da navigate) — thu tiep lan sau
+          if (cfg && cfg.debug) log(`[api] body mat (navigate?): ${e.message}`);
+          return;
+        }
+
+        if (!text || !text.trim().startsWith('{')) return; // khong phai JSON
+
+        done = true;
+        clearTimeout(timer);
+        page.off('response', handler);
+
+        if (cfg && cfg.debug) {
+          log(`[api] ${res.request().method()} ${res.status()} ${res.url()} :: ${text.slice(0, 300)}`);
+        }
+
+        try {
           const json = JSON.parse(text);
-          if (!json || typeof json !== 'object') return;
-          cleanup();
+          if (!json || typeof json !== 'object') {
+            return reject(new Error(`response khong phai JSON object (${path})`));
+          }
           resolve(json);
         } catch (err) {
-          // body rong hoac khong phai JSON -> bo qua, tiep tuc cho
-          if (this.cfg && this.cfg.debug) {
-            this.log(`[api] bo qua response khong phai JSON (${err.message})`);
-          }
+          reject(new Error(`Parse response loi (${path}): ${err.message} | raw: ${text.slice(0,100)}`));
         }
       };
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.page.off('response', onResponse);
-      };
-      this.page.on('response', onResponse);
+
+      page.on('response', handler);
     });
   }
 
-  /** Doc toast/loi dang hien tren trang (dung khi login that bai). */
+  /**
+   * Dung page.route() de intercept va doc body TRUOC khi browser nhan response
+   * (tranh race condition khi page navigate ngay sau login).
+   * Goi truoc khi trigger action. Sau khi lay duoc data, tu dong unroute.
+   */
+  waitForApiRoute(urlPattern) {
+    const log = this.log;
+    const page = this.page;
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const routeHandler = async (route) => {
+        const req = route.request();
+        if (req.method() === 'OPTIONS') { return route.continue(); }
+        // forward request va lay response
+        let resp;
+        try {
+          resp = await route.fetch();
+        } catch (e) {
+          if (!done) reject(e);
+          done = true;
+          return route.abort();
+        }
+        // doc body truoc khi fulfill (body van con vi chua navigate)
+        let body;
+        try {
+          body = await resp.body();
+        } catch (e) {
+          await route.fulfill({ response: resp });
+          if (!done) reject(new Error('route body err: ' + e.message));
+          done = true;
+          return;
+        }
+        // forward response ve browser binh thuong
+        await route.fulfill({ response: resp, body });
+        if (done) return;
+        const text = body.toString('utf8');
+        if (!text || !text.trim().startsWith('{')) return;
+        done = true;
+        page.unroute(urlPattern, routeHandler);
+        try {
+          resolve(JSON.parse(text));
+        } catch (e) {
+          reject(new Error('parse loi: ' + e.message));
+        }
+      };
+      page.route(urlPattern, routeHandler).catch(reject);
+    });
+  }
+
+  /** Doc toast/loi dang hien tren trang. */
   async readPageError() {
     return this.page
       .evaluate(() => {
@@ -193,29 +263,37 @@ class VSPhoneRegistrar {
     }
   }
 
-  /** Buoc 1: kiem tra email da ton tai hay chua (khong can captcha). */
-  async checkEmail(email) {
-    await this.page.goto(this.cfg.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await this.page.waitForSelector(SEL.email, { timeout: 30000 });
-    await this.page.fill(SEL.email, email);
+  /** 1 lan goi checkEmail (khong retry). */
+  async checkEmailOnce(email) {
+    const page = this.page;
+    await page.goto(this.cfg.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector(SEL.email, { timeout: 30000 });
+    await page.fill(SEL.email, email);
     await this.ensureTosChecked();
-    const p = this.waitForApi(API.checkEmail, 30000);
-    await this.page.click(SEL.submit);
-    const res = await p;
-    if (res.code !== 200) throw new Error(`checkEmail loi: ${JSON.stringify(res)}`);
-    return res.data === true; // true => email chua ton tai => can dang ky moi
+    const pCheck = this.waitForApi(API.checkEmail, 30000);
+    await page.click(SEL.submit);
+    return pCheck;
   }
 
-  /**
-   * Mo popup captcha Aliyun.
-   * Luu y: SDK Aliyun can thoi gian load, bam "Get code" som se bi loi
-   * "Failed to load the captcha component" -> tool doi chieu cho popup xuat hien.
-   */
+  async checkEmail(email, { retries = 5, baseDelayMs = 60000 } = {}) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      const res = await this.checkEmailOnce(email);
+      if (res && res.code === 200) return res.data === true;
+      if (isRateLimited(res)) {
+        const wait = baseDelayMs * attempt;
+        this.log(`[rate-limit] code ${res.code}, nghi ${Math.round(wait / 1000)}s (${attempt}/${retries})`);
+        await sleep(wait);
+        continue;
+      }
+      throw new Error(`checkEmail loi: ${JSON.stringify(res)}`);
+    }
+    throw new Error('VSPhone chan tan so lien tuc (1014)');
+  }
+
   async openCaptcha({ attempts = 4 } = {}) {
     const page = this.page;
     const log = this.log;
 
-    // cho SDK tao xong DOM cua captcha
     try {
       await page.waitForSelector(SEL.captchaWindow, { state: 'attached', timeout: 25000 });
     } catch (_) {
@@ -223,16 +301,13 @@ class VSPhoneRegistrar {
     }
 
     for (let i = 1; i <= attempts; i++) {
-      // dong hop thoai loi neu co
       try {
         const okBtn = page.locator('.el-message-box__btns .el-button').last();
         if (await okBtn.count()) {
           await okBtn.click({ timeout: 2000 });
           await sleep(300);
         }
-      } catch (_) {
-        /* ignore */
-      }
+      } catch (_) {}
 
       await page.click(SEL.getCode, { timeout: 10000 }).catch((e) => log(`[captcha] click loi: ${e.message}`));
       await sleep(2500);
@@ -248,7 +323,7 @@ class VSPhoneRegistrar {
         .catch(() => ({ exists: false, hidden: null }));
 
       if (state.exists && !state.hidden) {
-        log(`[captcha] popup captcha da mo (lan ${i})`);
+        log(`[captcha] popup mo (lan ${i})`);
         return true;
       }
       log(`[captcha] popup chua mo, thu lai (lan ${i})`);
@@ -256,42 +331,9 @@ class VSPhoneRegistrar {
     throw new Error('Khong mo duoc popup captcha Aliyun');
   }
 
-  /** 1 lan goi checkEmail (khong retry). Tra {code, data}. */
-  async checkEmailOnce(email) {
-    const page = this.page;
-    await page.goto(this.cfg.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector(SEL.email, { timeout: 30000 });
-    await page.fill(SEL.email, email);
-    await this.ensureTosChecked();
-    const pCheck = this.waitForApi(API.checkEmail, 30000);
-    await page.click(SEL.submit);
-    return pCheck;
-  }
-
-  /**
-   * Kiem tra email co ton tai hay khong, tu retry khi VSPhone tra code 1014
-   * ("Your operations are too frequent").
-   */
-  async checkEmail(email, { retries = 5, baseDelayMs = 60000 } = {}) {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      const res = await this.checkEmailOnce(email);
-      if (res && res.code === 200) return res.data === true;
-      if (isRateLimited(res)) {
-        const wait = baseDelayMs * attempt;
-        this.log(`[rate-limit] server chan tan so (code ${res.code}), nghi ${Math.round(wait / 1000)}s roi thu lai (${attempt}/${retries})`);
-        await sleep(wait);
-        continue;
-      }
-      throw new Error(`checkEmail loi: ${JSON.stringify(res)}`);
-    }
-    throw new Error('VSPhone chan tan so lien tuc (code 1014) - dung lai lau hon');
-  }
-
   /**
    * Dang ky 1 tai khoan.
-   * - email: dia chi se dung
-   * - password: mat khau (6-20 ky tu)
-   * - mailbox: provider co waitForCode()
+   * Khong doc/ghi localStorage — verify login qua API response.
    */
   async registerOne({ email, password, mailbox }) {
     const page = this.page;
@@ -315,39 +357,37 @@ class VSPhoneRegistrar {
       await this.openCaptcha();
 
       if (autoSolve) {
-        log(`[*] Dang tu dong giai captcha Aliyun bang solver tu vlolhaha/vmos (lan ${attempt}/3)...`);
+        log(`[*] Auto giai captcha (lan ${attempt}/3)...`);
         try {
           const solved = await solveAliyunPuzzle(page, this.imageBuffers, log, {
             maxAttempts: 3,
             powDelay: this.cfg.powDelay ?? 6000,
             saveDebug: !!this.cfg.saveDebug,
           });
-          if (!solved.success) {
-            log(`[!] Auto-solver chua giai duoc: ${solved.reason || 'that bai'}`);
-          }
+          if (!solved.success) log(`[!] Solver chua giai duoc: ${solved.reason || 'that bai'}`);
         } catch (solveErr) {
-          log(`[!] Loi trong qua trinh auto solve: ${solveErr.message}`);
+          log(`[!] Loi auto solve: ${solveErr.message}`);
         }
       } else {
-        log('[*] Che do thu cong: hay keo slider de gui ma...');
+        log('[*] Thu cong: hay keo slider...');
       }
 
       sms = await pSms.catch((e) => {
-        log(`[captcha] Cho smsSend timeout/loi: ${e.message}`);
+        log(`[captcha] smsSend timeout/loi: ${e.message}`);
         return null;
       });
 
       if (sms && sms.code === 200) break;
       if (isRateLimited(sms)) {
         const wait = 60000 * attempt;
-        log(`[rate-limit] chan tan so khi gui ma, nghi ${Math.round(wait / 1000)}s roi mo lai captcha`);
+        log(`[rate-limit] gui ma bi chan, nghi ${Math.round(wait / 1000)}s`);
         await sleep(wait);
         continue;
       }
-      log(`[captcha] Lan ${attempt} chua nhan duoc ma hop le, thu lai...`);
+      log(`[captcha] Lan ${attempt} chua nhan ma hop le, thu lai...`);
     }
-    if (!sms || sms.code !== 200) throw new Error('Khong gui duoc ma xac thuc sau 3 lan giai captcha');
-    log(`[*] Da gui ma xac thuc (isRegister=${sms.isRegister})`);
+    if (!sms || sms.code !== 200) throw new Error('Khong gui duoc ma xac thuc sau 3 lan');
+    log(`[*] Da gui ma xac thuc`);
 
     // --- buoc 4: lay ma 6 so tu mailbox
     const code = await mailbox.waitForCode({ timeoutMs: this.cfg.mailTimeoutMs });
@@ -356,60 +396,44 @@ class VSPhoneRegistrar {
     await this.ensureTosChecked();
     await this.dumpInputs('form');
 
-    // --- buoc 5: submit -> login
-    // Luu y: response cua /api/user/login co the bi mat body do browser
-    // navigate ngay sau khi server tra ve -> khong doi JSON, doi token trong
-    // localStorage giong cach bot vmos lam.
+    // --- buoc 5: submit -> intercept /api/user/login response voi route() (tranh body mat khi navigate)
+    const pLogin = this.waitForApiRoute('**/vsphone/api/user/login');
     await page.click(SEL.submit);
 
-    let token = null;
-    let userId = null;
-    const deadline = Date.now() + 90000;
-    while (Date.now() < deadline) {
-      token = await page.evaluate(() => localStorage.getItem('token')).catch(() => null);
-      userId = await page.evaluate(() => localStorage.getItem('userId')).catch(() => null);
-      if (token) break;
-      const pageError = await this.readPageError();
-      if (pageError) throw new Error(`Dang nhap that bai: ${pageError}`);
-      await sleep(1000);
-    }
+    const loginRes = await pLogin.catch((e) => {
+      log(`[login] timeout/loi khi cho response: ${e.message}`);
+      return null;
+    });
 
-    if (!token) {
+    // Kiem tra ket qua dang nhap
+    if (!loginRes) {
       const pageError = await this.readPageError();
       throw new Error(
-        `Dang nhap that bai: khong thay token trong localStorage${pageError ? ` (${pageError})` : ''}`,
+        `Dang nhap that bai: timeout${pageError ? ` | trang hien: ${pageError}` : ''}`,
       );
     }
 
-    // dump TOAN BO localStorage de tra ve qua API (khong luu gi ca)
-    const localStorage_ = await page
-      .evaluate(() => {
-        const out = {};
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          const v = localStorage.getItem(k);
-          // thu parse JSON, neu loi thi giu nguyen string
-          try { out[k] = JSON.parse(v); } catch (_) { out[k] = v; }
-        }
-        return out;
-      })
-      .catch(() => ({}));
-
-    if (!userId) {
-      // fallback: lay tu localStorage_ neu co
-      userId = localStorage_.userId
-        || (Array.isArray(localStorage_.users) && localStorage_.users[0]?.userId
-            ? String(localStorage_.users[0].userId) : null)
-        || null;
+    if (loginRes.code !== 200) {
+      const pageError = await this.readPageError();
+      throw new Error(
+        `Dang nhap that bai: code=${loginRes.code} msg=${loginRes.msg}${pageError ? ` | trang: ${pageError}` : ''}`,
+      );
     }
 
-    log(`[+] Dang ky thanh cong: ${email} (localStorage keys: ${Object.keys(localStorage_).join(', ')})`);
+    // Lay token + userId tu response (khong dung localStorage)
+    const data   = loginRes.data || {};
+    const token  = data.token || data.accessToken || data.access_token || null;
+    const userId = data.userId || data.user_id
+      ? String(data.userId || data.user_id)
+      : null;
+
+    log(`[+] Dang ky thanh cong: ${email} | token=${token ? 'co' : 'khong'} userId=${userId || 'null'}`);
+
     return {
       email,
       password,
-      token: token || null,
-      userId: userId ? String(userId) : null,
-      localStorage: localStorage_,
+      token,
+      userId,
       createdAt: new Date().toISOString(),
     };
   }

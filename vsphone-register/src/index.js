@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { VSPhoneRegistrar, sleep } = require('./registrar');
+const { createGist }              = require('./gist');
 const { createMailbox } = require('./mailbox');
 const { AccountDB } = require('./db');
 
@@ -200,9 +201,11 @@ async function main() {
         saveAccount(outDir, account);
         if (db) {
           try {
-            await db.save(account);
+            const gistUrl = await createGist({ email: account.email, localStorage: account.localStorage });
+            await db.save(account, gistUrl);
+            log(`[gist] ${gistUrl}`);
           } catch (err) {
-            log(`[!] Luu PostgreSQL that bai: ${err.message}`);
+            log(`[!] Luu DB/Gist that bai: ${err.message}`);
           }
         }
         results.push({ ...account, status: 'success' });
